@@ -29,3 +29,19 @@ signal that matters at this stage.
 This is the setup the NVMe tier will stress: once misses fault in from a real
 device instead of a HashMap, the gap between the Zipf fast path and the miss
 path is what decides when spilling to NVMe beats recomputing.
+
+## O(1) LRU
+
+Victim selection went from a full scan of the hot set to an intrusive linked
+list. Zipf 1.0, 10,000 pages, 1,000 hot, 200,000 gets, M4 Pro, `--release`.
+
+| Queue depth | p50 before | p50 after | p99 before | p99 after | p999 before | p999 after |
+|---|---|---|---|---|---|---|
+| 1 | 125 ns | 125 ns | 7,043 ns | 1,333 ns | 10,087 ns | 2,000 ns |
+| 2 | 250 ns | 334 ns | 99,967 ns | 13,335 ns | 265,983 ns | 21,759 ns |
+| 8 | 917 ns | 1,334 ns | 242,687 ns | 25,503 ns | 474,879 ns | 39,807 ns |
+| 32 | 917 ns | 1,334 ns | 241,919 ns | 24,591 ns | 473,599 ns | 38,175 ns |
+
+The tail is what moved. The scan ran under the cache lock, so every eviction
+stalled every other request; p99 at depth 8 drops about 10x. The median under
+contention rose about 45% and repeats across runs. Not explained yet.

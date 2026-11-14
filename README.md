@@ -34,7 +34,7 @@ storage tier and not the surrounding code.
 - [x] `Cache`: tiering, LRU eviction, hit/miss/eviction accounting
 - [x] Harness: sequential / uniform / zipfian workloads, HDR latency histograms
 - [x] Concurrency: configurable queue depth, single-flight coalescing of concurrent misses
-- [ ] O(1) LRU (replacing the current O(n) victim scan)
+- [x] O(1) LRU: intrusive linked list, p99 down ~10x under concurrency
 - [ ] `NvmeBackend`: `O_DIRECT` + `io_uring`, Linux only (see below)
 
 ## Platform note

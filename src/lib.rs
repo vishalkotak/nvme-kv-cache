@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 // 4096 because that's the native block size of
 // an NVME device so one of our pages maps to one
 // device block with no awakard fragmentation.
-pub const PAGE_SIZE: usize = 4906;
+pub const PAGE_SIZE: usize = 4096;
 
 pub type PageId = u64;
 
@@ -79,27 +79,88 @@ impl Backend for DramBackend {
     }
 }
 
+// Hot entries form an intrusive doubly linked list keyed by PageId:
+// head is most recently used, tail is the eviction victim. Touch and
+// evict are O(1) instead of scanning the whole hot set.
 struct CacheEntry {
     data: Box<[u8]>,
-    last_used: u64,
+    prev: Option<PageId>,
+    next: Option<PageId>,
 }
 
 // A fetch currently in progress for some page. Followers clone the Arc and
-// wait on `ready`; the leader fills `slot` then calls notify_waiters().
+// wait on `ready`; the leader fills `slot` with the result, then calls
+// notify_waiters(). Errors are stored too, so followers never wait forever.
 struct InFlight {
-    slot: Mutex<Option<Box<[u8]>>>,
+    slot: Mutex<Option<Result<Box<[u8]>, io::ErrorKind>>>,
     ready: Notify,
 }
 
 struct Inner {
     capacity: usize,
     hot: HashMap<PageId, CacheEntry>,
+    head: Option<PageId>,
+    tail: Option<PageId>,
     inflight: HashMap<PageId, Arc<InFlight>>,
-    tick: u64,
     hits: u64,
     misses: u64,
     coalesced: u64,
     evictions: u64,
+}
+
+impl Inner {
+    fn unlink(&mut self, id: PageId) {
+        let (prev, next) = {
+            let e = &self.hot[&id];
+            (e.prev, e.next)
+        };
+        match prev {
+            Some(p) => self.hot.get_mut(&p).unwrap().next = next,
+            None => self.head = next,
+        }
+        match next {
+            Some(n) => self.hot.get_mut(&n).unwrap().prev = prev,
+            None => self.tail = prev,
+        }
+    }
+
+    fn push_front(&mut self, id: PageId) {
+        let old_head = self.head;
+        {
+            let e = self.hot.get_mut(&id).unwrap();
+            e.prev = None;
+            e.next = old_head;
+        }
+        match old_head {
+            Some(h) => self.hot.get_mut(&h).unwrap().prev = Some(id),
+            None => self.tail = Some(id),
+        }
+        self.head = Some(id);
+    }
+
+    fn touch(&mut self, id: PageId) {
+        if self.head != Some(id) {
+            self.unlink(id);
+            self.push_front(id);
+        }
+    }
+
+    fn insert(&mut self, id: PageId, data: Box<[u8]>) {
+        if let Some(e) = self.hot.get_mut(&id) {
+            e.data = data;
+            self.touch(id);
+            return;
+        }
+        self.hot.insert(id, CacheEntry { data, prev: None, next: None });
+        self.push_front(id);
+    }
+
+    fn pop_lru(&mut self) -> Option<(PageId, Box<[u8]>)> {
+        let id = self.tail?;
+        self.unlink(id);
+        let entry = self.hot.remove(&id).expect("tail is in the hot set");
+        Some((id, entry.data))
+    }
 }
 
 // State mutated only while the lock is held.
@@ -116,8 +177,9 @@ impl<B: Backend> Cache<B> {
             inner: Mutex::new(Inner {
                 capacity,
                 hot: HashMap::new(),
+                head: None,
+                tail: None,
                 inflight: HashMap::new(),
-                tick: 0,
                 hits: 0,
                 misses: 0,
                 coalesced: 0,
@@ -129,12 +191,10 @@ impl<B: Backend> Cache<B> {
     pub async fn get(&self, id: PageId, out: &mut Page) -> io::Result<()> {
         let leader = {
             let mut inner = self.inner.lock().unwrap();
-            inner.tick += 1;
-            let now = inner.tick;
 
-            if let Some(entry) = inner.hot.get_mut(&id) {
-                entry.last_used = now;
+            if let Some(entry) = inner.hot.get(&id) {
                 out.data.copy_from_slice(&entry.data);
+                inner.touch(id);
                 inner.hits += 1;
                 return Ok(())
             }
@@ -155,19 +215,27 @@ impl<B: Backend> Cache<B> {
         };
         let (is_leader, inflight) = leader.unwrap();
         if !is_leader {
-            // Subtle ordering: check the slot BEFORE awaiting. If the leader
-            // already filled it and fired notify_waiters() before we started
-            // waiting, the notification is lost — so we must not block on a
-            // notify that already happened.
+            // Register interest BEFORE checking the slot. notify_waiters()
+            // only wakes futures that already exist, so checking first and
+            // creating the future after leaves a window where the wakeup is
+            // lost and this follower sleeps forever.
             loop {
+                let mut notified = std::pin::pin!(inflight.ready.notified());
+                notified.as_mut().enable();
                 {
                     let slot = inflight.slot.lock().unwrap();
-                    if let Some(bytes) = slot.as_ref() {
-                        out.data.copy_from_slice(bytes);
-                        return Ok(());
+                    match slot.as_ref() {
+                        Some(Ok(bytes)) => {
+                            out.data.copy_from_slice(bytes);
+                            return Ok(());
+                        }
+                        Some(Err(kind)) => {
+                            return Err(io::Error::new(*kind, "coalesced read failed"));
+                        }
+                        None => {}
                     }
                 }
-                    inflight.ready.notified().await;
+                notified.await;
             }
         }
 
@@ -177,14 +245,13 @@ impl<B: Backend> Cache<B> {
             Ok(()) => {
                 {
                     let mut slot = inflight.slot.lock().unwrap();
-                    *slot = Some(tmp.data.clone());
+                    *slot = Some(Ok(tmp.data.clone()));
                 }
                 inflight.ready.notify_waiters();
                 out.data.copy_from_slice(&tmp.data);
                 let victims = {
                     let mut inner = self.inner.lock().unwrap();
-                    let now = inner.tick;
-                    inner.hot.insert(id, CacheEntry { data: tmp.data, last_used: now });
+                    inner.insert(id, tmp.data);
                     inner.inflight.remove(&id);
                     Cache::<B>::take_eviction_victims(&mut inner)
                 };
@@ -192,6 +259,10 @@ impl<B: Backend> Cache<B> {
                 Ok(())
             }
             Err(e) => {
+                {
+                    let mut slot = inflight.slot.lock().unwrap();
+                    *slot = Some(Err(e.kind()));
+                }
                 inflight.ready.notify_waiters();
                 let mut inner = self.inner.lock().unwrap();
                 inner.inflight.remove(&id);
@@ -203,9 +274,7 @@ impl<B: Backend> Cache<B> {
     pub async fn put(&self, id: PageId, page: &Page) -> io::Result<()> {
         let victims = {
             let mut inner = self.inner.lock().unwrap();
-            inner.tick += 1;
-            let now = inner.tick;
-            inner.hot.insert(id, CacheEntry { data: page.data.clone(), last_used: now });
+            inner.insert(id, page.data.clone());
             Cache::<B>::take_eviction_victims(&mut inner)
         };
         self.spill(victims).await
@@ -217,13 +286,9 @@ impl<B: Backend> Cache<B> {
         let mut victims = Vec::new();
         while inner.hot.len() > inner.capacity {
             let victim = inner
-                .hot
-                .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(id, _)| *id)
+                .pop_lru()
                 .expect("hot is non-empty because len > capacity >= 1");
-            let entry = inner.hot.remove(&victim).expect("victim was just found");
-            victims.push((victim, entry.data));
+            victims.push(victim);
             inner.evictions += 1;
         }
         victims
@@ -479,5 +544,81 @@ mod concurrency_tests {
         let reads = cache.backend.reads.load(Ordering::SeqCst);
         assert_eq!(reads, 1, "single-flight should coalesce to one read, got {reads}");
         assert_eq!(cache.coalesced(), 15); // 1 leader + 15 followers
+    }
+
+    /// Every read fails after a delay, so followers are parked when it does.
+    struct FailingBackend;
+    impl Backend for FailingBackend {
+        async fn put(&self, _: PageId, _: &Page) -> io::Result<()> { Ok(()) }
+        async fn get(&self, _: PageId, _: &mut Page) -> io::Result<()> {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Err(io::Error::new(io::ErrorKind::TimedOut, "device timeout"))
+        }
+        async fn delete(&self, _: PageId) -> io::Result<()> { Ok(()) }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_read_reaches_every_follower() {
+        let cache = Arc::new(Cache::new(FailingBackend, 4));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let c = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                let mut out = Page::zeroed();
+                c.get(9, &mut out).await.unwrap_err().kind()
+            }));
+        }
+        let all = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut kinds = Vec::new();
+            for h in handles {
+                kinds.push(h.await.unwrap());
+            }
+            kinds
+        })
+        .await
+        .expect("followers hung after the leader's read failed");
+        assert!(all.iter().all(|k| *k == io::ErrorKind::TimedOut));
+    }
+}
+
+#[cfg(test)]
+mod lru_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// Drive the cache and a VecDeque reference model with the same random
+    /// ops; the evicted page and hot set must match after every step.
+    #[tokio::test]
+    async fn matches_reference_lru() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let capacity = 8;
+        let cache = Cache::new(DramBackend::new(), capacity);
+        let mut model: VecDeque<PageId> = VecDeque::new(); // front = MRU
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut out = Page::zeroed();
+        let mut written = std::collections::HashSet::new();
+
+        for _ in 0..5_000 {
+            let id = rng.gen_range(0..32);
+            // A get needs the page to exist somewhere, so write it first.
+            if rng.gen_bool(0.5) || written.insert(id) {
+                cache.put(id, &Page::zeroed()).await.unwrap();
+            } else {
+                cache.get(id, &mut out).await.unwrap();
+            }
+            model.retain(|&x| x != id);
+            model.push_front(id);
+            model.truncate(capacity);
+
+            let inner = cache.inner.lock().unwrap();
+            let mut order = Vec::new();
+            let mut cur = inner.head;
+            while let Some(p) = cur {
+                order.push(p);
+                cur = inner.hot[&p].next;
+            }
+            assert_eq!(order, model.iter().copied().collect::<Vec<_>>());
+            assert_eq!(inner.tail, model.back().copied());
+        }
     }
 }
