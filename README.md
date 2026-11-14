@@ -27,6 +27,8 @@ The `Backend` trait is the seam: the same `Cache` and `Harness` run against
 either backend, so any change in the measured numbers is attributable to the
 storage tier and not the surrounding code.
 
+Design: [DESIGN.md](DESIGN.md). Results: [BENCHMARKS.md](BENCHMARKS.md).
+
 ## Status
 
 - [x] Core types: `Page` (fixed 4 KiB), `PageId`, `Backend` trait
