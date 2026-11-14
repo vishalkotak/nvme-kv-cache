@@ -14,6 +14,8 @@ LLM serving runs out of fast memory for KV cache. Pages can be dropped and recom
 
 **O(1) LRU.** An intrusive linked list replaced a full scan under the cache lock. The scan stalled every request during eviction, and p99 dropped about 10x once it was gone.
 
+**io_uring behind the same trait.** One thread owns the ring, drains every queued request into the submission queue, and submits the batch with one syscall. The blocking pool pays a thread handoff and a syscall per I/O and flattens near 49k req/s; the ring reaches 158k at depth 32 on the same disk.
+
 **Evicted pages stay readable until written.** Eviction leaves the lock before the disk write finishes. Without a write-back buffer, a page sat in neither tier during that window, and gets returned NotFound. Writes to one page are ordered with striped locks, so an older copy never lands after a newer one.
 
 ## Failure modes
@@ -23,4 +25,4 @@ LLM serving runs out of fast memory for KV cache. Pages can be dropped and recom
 
 ## Next
 
-Linux NVMe numbers, an `io_uring` submission path, then a recompute cost model so the benchmark answers spill vs recompute directly.
+Linux NVMe numbers, then a recompute cost model so the benchmark answers spill vs recompute directly.

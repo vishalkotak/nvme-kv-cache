@@ -21,8 +21,8 @@ use crate::{Backend, PAGE_SIZE, Page, PageId};
 // logical block size. 4096 covers every device worth benchmarking.
 const ALIGN: usize = 4096;
 
-struct AlignedBuf {
-    ptr: *mut u8,
+pub(crate) struct AlignedBuf {
+    pub(crate) ptr: *mut u8,
 }
 
 // The buffer is owned by exactly one task at a time.
@@ -33,17 +33,17 @@ impl AlignedBuf {
         Layout::from_size_align(PAGE_SIZE, ALIGN).expect("valid layout")
     }
 
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let ptr = unsafe { alloc_zeroed(Self::layout()) };
         assert!(!ptr.is_null(), "aligned allocation failed");
         AlignedBuf { ptr }
     }
 
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, PAGE_SIZE) }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, PAGE_SIZE) }
     }
 }

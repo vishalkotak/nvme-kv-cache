@@ -1,5 +1,7 @@
 pub mod workload;
 pub mod file_backend;
+#[cfg(target_os = "linux")]
+pub mod uring_backend;
 
 use std::io;
 use std::collections::HashMap;

@@ -68,3 +68,24 @@ page's 4 KiB write.
   560k at depth 2 and up: task spawn plus one cache lock costs more than a
   HashMap read. Concurrency only pays when the miss is slow.
 - Next: the same table on Linux NVMe with `O_DIRECT`, then with `io_uring`.
+
+## io_uring vs blocking pool
+
+`scripts/linux.sh bench file` and `bench uring`. Linux 6.10 VM on the same Mac
+(Docker Desktop, 12 vCPU), `O_DIRECT` on ext4. The disk is virtio backed by
+the Mac SSD, so this compares submission paths, not NVMe.
+
+| Queue depth | Blocking pool | io_uring | p99 pool | p99 io_uring |
+|---|---|---|---|---|
+| 1 | 17,801 req/s | 18,161 req/s | 256 µs | 250 µs |
+| 8 | 40,030 req/s | 65,182 req/s | 1.23 ms | 515 µs |
+| 16 | 45,897 req/s | 107,321 req/s | 3.00 ms | 681 µs |
+| 32 | 48,893 req/s | 158,059 req/s | 6.93 ms | 989 µs |
+
+- Same at depth 1: one I/O at a time costs the same either way.
+- The pool flattens near 49k req/s while its p99 grows 27x. Each I/O is a
+  thread handoff plus a syscall.
+- io_uring keeps scaling: 3.2x the pool's throughput at depth 32 with a 7x
+  lower p99. One ring thread submits a batch per syscall.
+- A second run matched within 10% on throughput. p999 at depth 32 is noisy
+  (4 to 11 ms) and isn't a result yet.
