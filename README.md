@@ -1,5 +1,7 @@
 # nvme-kv-cache
 
+[![ci](https://github.com/vishalkotak/nvme-kv-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/vishalkotak/nvme-kv-cache/actions/workflows/ci.yml)
+
 A tiered key-value cache that keeps hot pages in DRAM and spills cold pages to
 a slower backing tier, built to study NVMe storage behavior under realistic
 access patterns. Inspired by how LLM inference engines (e.g. vLLM's
