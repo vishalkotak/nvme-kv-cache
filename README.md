@@ -33,7 +33,7 @@ storage tier and not the surrounding code.
 - [x] `DramBackend`: in-memory baseline
 - [x] `Cache`: tiering, LRU eviction, hit/miss/eviction accounting
 - [x] Harness: sequential / uniform / zipfian workloads, HDR latency histograms
-- [ ] Concurrency / queue depth (in progress)
+- [x] Concurrency: configurable queue depth, single-flight coalescing of concurrent misses
 - [ ] O(1) LRU (replacing the current O(n) victim scan)
 - [ ] `NvmeBackend`: `O_DIRECT` + `io_uring`, Linux only (see below)
 
