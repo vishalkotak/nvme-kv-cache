@@ -38,17 +38,16 @@ Design: [DESIGN.md](DESIGN.md). Results: [BENCHMARKS.md](BENCHMARKS.md).
 - [x] Concurrency: configurable queue depth, single-flight coalescing of concurrent misses
 - [x] O(1) LRU: intrusive linked list, p99 down ~10x under concurrency
 - [x] `FileBackend`: real device I/O, page cache bypassed, blocking-pool queue depth
-- [x] Eviction write-back buffer: a page is never in neither tier
+- [x] Write-back buffer: evicted pages stay readable until written
 - [ ] Linux NVMe numbers
 - [ ] `io_uring` submission path
 
 ## Platform note
 
-The NVMe backend requires Linux: `O_DIRECT` and `io_uring` do not exist on
-macOS, and Apple Silicon storage sits behind the Apple Fabric controller with
-no reachable device queues. The portable layers (everything except
-`NvmeBackend`) run anywhere; device experiments target a Linux instance with
-**local/instance NVMe** (not network-attached block storage).
+`FileBackend` runs on Linux (`O_DIRECT`) and macOS (`F_NOCACHE`). `io_uring`
+is Linux only, and Apple Silicon storage has no reachable device queues, so
+NVMe experiments target a Linux instance with local NVMe, not network block
+storage.
 
 ## Running
 
