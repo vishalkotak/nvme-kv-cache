@@ -20,7 +20,7 @@ Harness   generates access patterns, controls queue depth, records latency
 Cache     tiering policy: bounded DRAM hot set, LRU eviction, fault-in on miss
    |
 Backend   stores pages by id. Two implementations behind one trait:
-          DramBackend (HashMap, baseline) | NvmeBackend (Linux, planned)
+          DramBackend (HashMap, baseline) | FileBackend (O_DIRECT / F_NOCACHE)
 ```
 
 The `Backend` trait is the seam: the same `Cache` and `Harness` run against
@@ -35,7 +35,10 @@ storage tier and not the surrounding code.
 - [x] Harness: sequential / uniform / zipfian workloads, HDR latency histograms
 - [x] Concurrency: configurable queue depth, single-flight coalescing of concurrent misses
 - [x] O(1) LRU: intrusive linked list, p99 down ~10x under concurrency
-- [ ] `NvmeBackend`: `O_DIRECT` + `io_uring`, Linux only (see below)
+- [x] `FileBackend`: real device I/O, page cache bypassed, blocking-pool queue depth
+- [x] Eviction write-back buffer: a page is never in neither tier
+- [ ] Linux NVMe numbers
+- [ ] `io_uring` submission path
 
 ## Platform note
 
@@ -48,7 +51,8 @@ no reachable device queues. The portable layers (everything except
 ## Running
 
 ```
-cargo run --release   # runs the harness across all three access patterns
+cargo run --release                        # DRAM cold tier
+cargo run --release -- file /mnt/nvme/kv    # file cold tier on a real disk
 cargo test            # unit tests for the backend and tiering logic
 ```
 

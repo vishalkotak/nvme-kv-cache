@@ -45,3 +45,26 @@ list. Zipf 1.0, 10,000 pages, 1,000 hot, 200,000 gets, M4 Pro, `--release`.
 The tail is what moved. The scan ran under the cache lock, so every eviction
 stalled every other request; p99 at depth 8 drops about 10x. The median under
 contention rose about 45% and repeats across runs. Not explained yet.
+
+## File backend on SSD
+
+`FileBackend` as the cold tier, page cache bypassed (`F_NOCACHE`). Same
+workload, M4 Pro internal SSD. A miss pays a 4 KiB read plus the evicted
+page's 4 KiB write.
+
+| Queue depth | Throughput | p50 | p99 | p999 |
+|---|---|---|---|---|
+| 1 | 17,392 req/s | 334 ns | 430 µs | 541 µs |
+| 2 | 32,570 req/s | 250 ns | 482 µs | 559 µs |
+| 4 | 47,444 req/s | 459 ns | 597 µs | 1.80 ms |
+| 8 | 74,785 req/s | 375 ns | 698 µs | 995 µs |
+| 16 | 91,457 req/s | 417 ns | 936 µs | 1.25 ms |
+| 32 | 108,336 req/s | 500 ns | 1.56 ms | 2.08 ms |
+
+- Throughput grows 6.2x from depth 1 to 32 while p99 grows 3.6x. The device
+  has parallelism a single outstanding I/O leaves idle.
+- p50 stays a DRAM hit (67.5% hit rate). The tail is the device.
+- DRAM as the cold tier peaks at depth 1 (2.3M req/s) and drops to about
+  560k at depth 2 and up: task spawn plus one cache lock costs more than a
+  HashMap read. Concurrency only pays when the miss is slow.
+- Next: the same table on Linux NVMe with `O_DIRECT`, then with `io_uring`.

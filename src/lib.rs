@@ -1,4 +1,5 @@
 pub mod workload;
+pub mod file_backend;
 
 use std::io;
 use std::collections::HashMap;
@@ -44,13 +45,14 @@ impl DramBackend {
 // We will have a harness whose job includes controlling queue
 // depth - how many read and writes are in flight at once. We 
 // will have multiple get futures against the backend.
-pub trait Backend {
-    
-    async fn put(&self, id: PageId, page: &Page) -> io::Result<()>;
+// Futures are Send so the harness can spawn cache calls onto a
+// multi-threaded runtime for any backend, not just concrete ones.
+pub trait Backend: Send + Sync {
+    fn put(&self, id: PageId, page: &Page) -> impl Future<Output = io::Result<()>> + Send;
 
-    async fn get(&self, id: PageId, out: &mut Page) -> io::Result<()>;
+    fn get(&self, id: PageId, out: &mut Page) -> impl Future<Output = io::Result<()>> + Send;
 
-    async fn delete(&self, id: PageId) -> io::Result<()>;
+    fn delete(&self, id: PageId) -> impl Future<Output = io::Result<()>> + Send;
 }
 
 impl Backend for DramBackend {
@@ -102,6 +104,12 @@ struct Inner {
     head: Option<PageId>,
     tail: Option<PageId>,
     inflight: HashMap<PageId, Arc<InFlight>>,
+    // Evicted pages whose write to the backend has not finished yet, with a
+    // generation per eviction. Without this, a page is in neither tier
+    // between leaving `hot` and landing on disk, and a get in that window
+    // returns NotFound.
+    spilling: HashMap<PageId, (u64, Box<[u8]>)>,
+    spill_gen: u64,
     hits: u64,
     misses: u64,
     coalesced: u64,
@@ -163,10 +171,16 @@ impl Inner {
     }
 }
 
+// Spills of one page must reach the backend in order, or an older copy can
+// land after a newer one. Striping by page id keeps that order per page
+// while different pages still write in parallel.
+const SPILL_STRIPES: usize = 64;
+
 // State mutated only while the lock is held.
 pub struct Cache<B: Backend> {
     backend: B,
     inner: Mutex<Inner>,
+    spill_locks: Vec<tokio::sync::Mutex<()>>,
 }
 
 impl<B: Backend> Cache<B> {
@@ -174,12 +188,15 @@ impl<B: Backend> Cache<B> {
         assert!(capacity >= 1, "Capacity must be at least 1");
         Cache {
             backend,
+            spill_locks: (0..SPILL_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect(),
             inner: Mutex::new(Inner {
                 capacity,
                 hot: HashMap::new(),
                 head: None,
                 tail: None,
                 inflight: HashMap::new(),
+                spilling: HashMap::new(),
+                spill_gen: 0,
                 hits: 0,
                 misses: 0,
                 coalesced: 0,
@@ -195,6 +212,14 @@ impl<B: Backend> Cache<B> {
             if let Some(entry) = inner.hot.get(&id) {
                 out.data.copy_from_slice(&entry.data);
                 inner.touch(id);
+                inner.hits += 1;
+                return Ok(())
+            }
+
+            // Evicted but not yet on disk: the write-back buffer is the
+            // newest copy, so serve it rather than reading a stale backend.
+            if let Some((_, data)) = inner.spilling.get(&id) {
+                out.data.copy_from_slice(data);
                 inner.hits += 1;
                 return Ok(())
             }
@@ -251,7 +276,11 @@ impl<B: Backend> Cache<B> {
                 out.data.copy_from_slice(&tmp.data);
                 let victims = {
                     let mut inner = self.inner.lock().unwrap();
-                    inner.insert(id, tmp.data);
+                    // A put may have landed while we were reading. Its copy
+                    // is newer than ours, so don't overwrite it.
+                    if !inner.hot.contains_key(&id) && !inner.spilling.contains_key(&id) {
+                        inner.insert(id, tmp.data);
+                    }
                     inner.inflight.remove(&id);
                     Cache::<B>::take_eviction_victims(&mut inner)
                 };
@@ -280,24 +309,37 @@ impl<B: Backend> Cache<B> {
         self.spill(victims).await
     }
 
-    fn take_eviction_victims(
-        inner: &mut Inner,
-    ) -> Vec<(PageId, Box<[u8]>)> {
+    fn take_eviction_victims(inner: &mut Inner) -> Vec<PageId> {
         let mut victims = Vec::new();
         while inner.hot.len() > inner.capacity {
-            let victim = inner
+            let (id, data) = inner
                 .pop_lru()
                 .expect("hot is non-empty because len > capacity >= 1");
-            victims.push(victim);
+            inner.spill_gen += 1;
+            let generation = inner.spill_gen;
+            inner.spilling.insert(id, (generation, data));
+            victims.push(id);
             inner.evictions += 1;
         }
         victims
     }
 
-    async fn spill(&self, victims: Vec<(PageId, Box<[u8]>)>) -> io::Result<()> {
-        for (id, data) in victims {
-            let page = Page { data };
+    async fn spill(&self, victims: Vec<PageId>) -> io::Result<()> {
+        for id in victims {
+            let _ordered = self.spill_locks[id as usize % SPILL_STRIPES].lock().await;
+            // Write whatever is newest now, not what this eviction captured:
+            // if a later eviction of the same page got here first, it already
+            // wrote the newest copy and this write repeats it harmlessly.
+            let snapshot = {
+                let inner = self.inner.lock().unwrap();
+                inner.spilling.get(&id).map(|(g, d)| (*g, Page { data: d.clone() }))
+            };
+            let Some((generation, page)) = snapshot else { continue };
             self.backend.put(id, &page).await?;
+            let mut inner = self.inner.lock().unwrap();
+            if inner.spilling.get(&id).is_some_and(|(g, _)| *g == generation) {
+                inner.spilling.remove(&id);
+            }
         }
         Ok(())
     }
@@ -349,9 +391,11 @@ pub struct BenchResult {
     pub coalesced: u64,
     pub hit_rate: f64,
     pub histogram: Histogram<u64>,
+    pub elapsed: std::time::Duration,
 }
 
-pub async fn run_workload(
+pub async fn run_workload<B: Backend + 'static>(
+    backend: B,
     pattern: Pattern,
     num_pages: u64,
     capacity: usize,
@@ -361,7 +405,7 @@ pub async fn run_workload(
 ) -> io::Result<BenchResult> {
 
     assert!(queue_depth >= 1, "queue_depth must be at least 1");
-    let mut cache = Cache::new(DramBackend::new(), capacity);
+    let mut cache = Cache::new(backend, capacity);
     let filler = Page::zeroed();
     for id in 0..num_pages {
         cache.put(id, &filler).await?;
@@ -369,6 +413,7 @@ pub async fn run_workload(
     cache.reset_stats();
     let cache = Arc::new(cache);
     let requests = generate(pattern, num_pages, num_requests, seed);
+    let started = Instant::now();
     let mut hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3)
         .expect("valid histogram bounds");
 
@@ -418,6 +463,7 @@ pub async fn run_workload(
             evictions: cache.evictions(),
             hit_rate: cache.hit_rate(),
             histogram: hist,
+            elapsed: started.elapsed(),
         })
 }
     

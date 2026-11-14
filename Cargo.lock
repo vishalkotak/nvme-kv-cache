@@ -153,6 +153,7 @@ version = "0.1.0"
 dependencies = [
  "hdrhistogram",
  "histogram",
+ "libc",
  "rand",
  "tokio",
 ]
